@@ -21,9 +21,18 @@ SEEN_FILE = "seen_posts.txt"
 STATE_FILE = "state.json"
 HEARTBEAT_FILE = "last_heartbeat.txt"
 
-REDDIT_URL = "https://www.reddit.com/r/ClaudeAI/new.json?limit=15"
+# old.reddit.com RSS first (least bot-blocking), then the standard RSS endpoint.
+REDDIT_FEEDS = [
+    "https://old.reddit.com/r/ClaudeAI/new/.rss?limit=15",
+    "https://www.reddit.com/r/ClaudeAI/new/.rss?limit=15",
+]
 STATUS_URL = "https://status.anthropic.com/history.rss"
 USER_AGENT = "claude-usage-reset-scanner/2.0"
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+REDDIT_ENTRIES = 15
 
 MAX_SEEN = 200
 STATUS_ENTRIES = 5
@@ -136,26 +145,60 @@ def reddit_should_alert(post, cfg):
     score, high_count = score_title(post["title"], cfg)
     if score is None or score < cfg["score_threshold"]:
         return False
-    return post["score"] >= cfg["min_upvotes"] or high_count >= 2
+    # RSS carries no upvote count (score is None); the title score gate above still applies.
+    upvotes = post["score"]
+    return upvotes is None or upvotes >= cfg["min_upvotes"] or high_count >= 2
+
+
+def get_logged(url, user_agent):
+    """GET with explicit failure logging (status code, Retry-After, short body excerpt)."""
+    label = re.sub(r"\?.*$", "", url)
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": user_agent, "Accept": "application/rss+xml, application/xml, */*"},
+            timeout=20,
+        )
+    except Exception as exc:
+        print(f"GET {label} failed: {type(exc).__name__}")
+        raise
+    if resp.status_code >= 400:
+        body = re.sub(r"\s+", " ", clean_text(resp.text))[:200]
+        retry = resp.headers.get("Retry-After")
+        extra = f", Retry-After={retry}" if retry else ""
+        print(f"GET {label} -> HTTP {resp.status_code}{extra}; body: {body!r}")
+        resp.raise_for_status()
+    return resp
+
+
+def parse_reddit_atom(xml_bytes):
+    root = ET.fromstring(xml_bytes)
+    posts = []
+    for e in [x for x in root.iter() if _local(x.tag) in ("entry", "item")][:REDDIT_ENTRIES]:
+        link = _entry_link(e)
+        raw_id = _child_text(e, "id") or _child_text(e, "guid") or link
+        content = _child_text(e, "content") or _child_text(e, "description")
+        m = re.search(r'<div class="md">(.*?)</div>', content, re.S)  # drop "submitted by" footer
+        posts.append({
+            "id": re.sub(r"^t3_", "", raw_id),
+            "title": _child_text(e, "title"),
+            "selftext": m.group(1) if m else "",
+            "url": link,
+            "score": None,  # not available in RSS
+            "flair": "",
+        })
+    return posts
 
 
 def fetch_reddit():
-    resp = requests.get(REDDIT_URL, headers={"User-Agent": USER_AGENT}, timeout=20)
-    resp.raise_for_status()
-    posts = []
-    for child in resp.json()["data"]["children"]:
-        d = child["data"]
-        permalink = d.get("permalink")
-        link = "https://www.reddit.com" + permalink if permalink else d.get("url", "")
-        posts.append({
-            "id": d["id"],
-            "title": d.get("title", ""),
-            "selftext": d.get("selftext", ""),
-            "url": link,
-            "score": int(d.get("score", 0)),
-            "flair": d.get("link_flair_text") or "",
-        })
-    return posts
+    last_exc = None
+    for url in REDDIT_FEEDS:
+        try:
+            return parse_reddit_atom(get_logged(url, BROWSER_USER_AGENT).content)
+        except Exception as exc:
+            last_exc = exc
+            print(f"Reddit endpoint failed ({type(exc).__name__}); trying next")
+    raise RuntimeError("all Reddit endpoints failed") from last_exc
 
 
 # --------------------------------------------------------------------------- #
@@ -202,9 +245,7 @@ def parse_status(xml_bytes):
 
 
 def fetch_status():
-    resp = requests.get(STATUS_URL, headers={"User-Agent": USER_AGENT}, timeout=20)
-    resp.raise_for_status()
-    return parse_status(resp.content)
+    return parse_status(get_logged(STATUS_URL, USER_AGENT).content)
 
 
 def status_relevant(incident, cfg):
