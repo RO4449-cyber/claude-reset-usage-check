@@ -14,8 +14,24 @@ NTFY_URL = "https://ntfy.sh/claude_usage_reset_check"
 SEEN_FILE = "seen_posts.txt"
 MAX_ENTRIES = 10
 
-BONUS_WORDS = ["free", "bonus", "gift", "everyone", "extra"]
-USAGE_WORDS = ["reset", "limit", "limits", "usage", "quota", "tokens"]
+# Title must contain one of these exact phrases (case-insensitive).
+EXACT_PHRASES = [
+    "limit reset",
+    "limits reset",
+    "reset limits",
+    "reset my limit",
+    "quota reset",
+    "usage reset",
+    "free reset",
+    "reset for everyone",
+    "extra messages",
+    "raised limits",
+    "limits increased",
+]
+# ...or contain "reset" together with one of these.
+LIMIT_PHRASES = ["rate limit", "usage limit", "message limit"]
+# Titles containing any of these are user questions and are ignored.
+IGNORE_PHRASES = ["how to reset", "should i reset", "does it reset"]
 
 
 def load_seen():
@@ -57,14 +73,17 @@ def parse_feed(xml_bytes):
         title = child_text(e, "title")
         link = entry_link(e)
         eid = child_text(e, "id") or child_text(e, "guid") or link
-        body = child_text(e, "content") or child_text(e, "summary") or child_text(e, "description")
-        results.append({"id": eid, "title": title, "link": link, "text": f"{title} {body}"})
+        results.append({"id": eid, "title": title, "link": link})
     return results
 
 
-def matches(text):
-    t = text.lower()
-    return any(w in t for w in BONUS_WORDS) and any(w in t for w in USAGE_WORDS)
+def matches(title):
+    t = title.lower()
+    if any(p in t for p in IGNORE_PHRASES):
+        return False
+    if any(p in t for p in EXACT_PHRASES):
+        return True
+    return "reset" in t and any(p in t for p in LIMIT_PHRASES)
 
 
 def send_alert(title, link):
@@ -92,7 +111,7 @@ def main():
             print(f"Failed to fetch {url}: {exc}")
             continue
         for entry in entries:
-            if entry["id"] in seen or not matches(entry["text"]):
+            if entry["id"] in seen or not matches(entry["title"]):
                 continue
             try:
                 send_alert(entry["title"], entry["link"])
