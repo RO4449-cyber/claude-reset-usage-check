@@ -33,6 +33,9 @@ BROWSER_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 REDDIT_ENTRIES = 15
+REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
+REDDIT_API_URL = "https://oauth.reddit.com/r/ClaudeAI/new?limit=15&raw_json=1"
+REDDIT_OAUTH_UA = "script:claude-usage-reset-scanner:2.0"
 
 MAX_SEEN = 200
 STATUS_ENTRIES = 5
@@ -190,7 +193,68 @@ def parse_reddit_atom(xml_bytes):
     return posts
 
 
+def reddit_oauth_token(client_id, client_secret):
+    """App-only OAuth (client_credentials); no Reddit account password needed."""
+    try:
+        resp = requests.post(
+            REDDIT_TOKEN_URL,
+            auth=(client_id, client_secret),
+            data={"grant_type": "client_credentials"},
+            headers={"User-Agent": REDDIT_OAUTH_UA},
+            timeout=20,
+        )
+    except Exception as exc:
+        print(f"Reddit token request failed: {type(exc).__name__}")
+        raise
+    if resp.status_code >= 400:
+        print(f"Reddit token request -> HTTP {resp.status_code}")
+        resp.raise_for_status()
+    token = resp.json().get("access_token")
+    if not token:
+        raise RuntimeError("Reddit token response had no access_token")
+    return token
+
+
+def fetch_reddit_oauth(client_id, client_secret):
+    token = reddit_oauth_token(client_id, client_secret)
+    try:
+        resp = requests.get(
+            REDDIT_API_URL,
+            headers={"User-Agent": REDDIT_OAUTH_UA, "Authorization": f"Bearer {token}"},
+            timeout=20,
+        )
+    except Exception as exc:
+        print(f"Reddit API request failed: {type(exc).__name__}")
+        raise
+    if resp.status_code >= 400:
+        retry = resp.headers.get("Retry-After")
+        print(f"Reddit API -> HTTP {resp.status_code}" + (f", Retry-After={retry}" if retry else ""))
+        resp.raise_for_status()
+    posts = []
+    for child in resp.json()["data"]["children"][:REDDIT_ENTRIES]:
+        d = child["data"]
+        permalink = d.get("permalink")
+        posts.append({
+            "id": d["id"],
+            "title": d.get("title", ""),
+            "selftext": d.get("selftext", ""),
+            "url": "https://www.reddit.com" + permalink if permalink else d.get("url", ""),
+            "score": int(d.get("score", 0)),
+            "flair": d.get("link_flair_text") or "",
+        })
+    return posts
+
+
 def fetch_reddit():
+    client_id = os.environ.get("REDDIT_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
+    if client_id and client_secret:
+        try:
+            return fetch_reddit_oauth(client_id, client_secret)
+        except Exception as exc:
+            print(f"Reddit OAuth failed ({type(exc).__name__}); falling back to RSS")
+    else:
+        print("REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET not set; using RSS fallback (no upvote counts)")
     last_exc = None
     for url in REDDIT_FEEDS:
         try:
