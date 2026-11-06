@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
@@ -33,9 +34,15 @@ BROWSER_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 REDDIT_ENTRIES = 15
-REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
-REDDIT_API_URL = "https://oauth.reddit.com/r/ClaudeAI/new?limit=15&raw_json=1"
-REDDIT_OAUTH_UA = "script:claude-usage-reset-scanner:2.0"
+# Public Reddit JSON (has upvote scores). Fetched through public proxies because
+# GitHub-hosted runner IPs are blocked by Reddit. Only this public URL is sent to proxies.
+REDDIT_JSON_URL = "https://www.reddit.com/r/ClaudeAI/new.json?limit=15&raw_json=1"
+REDDIT_PROXIES = [
+    ("corsproxy.io", "https://corsproxy.io/?url={q}"),
+    ("allorigins.win", "https://api.allorigins.win/raw?url={q}"),
+    ("codetabs.com", "https://api.codetabs.com/v1/proxy/?quest={q}"),
+    ("r.jina.ai", "https://r.jina.ai/{raw}"),
+]
 
 MAX_SEEN = 200
 STATUS_ENTRIES = 5
@@ -193,45 +200,29 @@ def parse_reddit_atom(xml_bytes):
     return posts
 
 
-def reddit_oauth_token(client_id, client_secret):
-    """App-only OAuth (client_credentials); no Reddit account password needed."""
+def extract_listing(text):
+    """Return the Reddit listing dict from a raw JSON body, or from a proxy wrapper
+    (e.g. Jina returns {"data": {"content": "<json text>"}} or plain text around the JSON)."""
     try:
-        resp = requests.post(
-            REDDIT_TOKEN_URL,
-            auth=(client_id, client_secret),
-            data={"grant_type": "client_credentials"},
-            headers={"User-Agent": REDDIT_OAUTH_UA},
-            timeout=20,
-        )
-    except Exception as exc:
-        print(f"Reddit token request failed: {type(exc).__name__}")
-        raise
-    if resp.status_code >= 400:
-        print(f"Reddit token request -> HTTP {resp.status_code}")
-        resp.raise_for_status()
-    token = resp.json().get("access_token")
-    if not token:
-        raise RuntimeError("Reddit token response had no access_token")
-    return token
+        obj = json.loads(text)
+    except ValueError:
+        obj = None
+    if isinstance(obj, dict) and isinstance(obj.get("data"), dict):
+        if "children" in obj["data"]:
+            return obj
+        text = str(obj["data"].get("content", ""))
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError("no JSON listing in response")
+    obj = json.loads(text[start:end + 1])
+    if not (isinstance(obj.get("data"), dict) and "children" in obj["data"]):
+        raise ValueError("response is not a Reddit listing")
+    return obj
 
 
-def fetch_reddit_oauth(client_id, client_secret):
-    token = reddit_oauth_token(client_id, client_secret)
-    try:
-        resp = requests.get(
-            REDDIT_API_URL,
-            headers={"User-Agent": REDDIT_OAUTH_UA, "Authorization": f"Bearer {token}"},
-            timeout=20,
-        )
-    except Exception as exc:
-        print(f"Reddit API request failed: {type(exc).__name__}")
-        raise
-    if resp.status_code >= 400:
-        retry = resp.headers.get("Retry-After")
-        print(f"Reddit API -> HTTP {resp.status_code}" + (f", Retry-After={retry}" if retry else ""))
-        resp.raise_for_status()
+def parse_reddit_listing(obj):
     posts = []
-    for child in resp.json()["data"]["children"][:REDDIT_ENTRIES]:
+    for child in obj["data"]["children"][:REDDIT_ENTRIES]:
         d = child["data"]
         permalink = d.get("permalink")
         posts.append({
@@ -245,16 +236,33 @@ def fetch_reddit_oauth(client_id, client_secret):
     return posts
 
 
-def fetch_reddit():
-    client_id = os.environ.get("REDDIT_CLIENT_ID", "").strip()
-    client_secret = os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
-    if client_id and client_secret:
+def fetch_reddit_via_proxies():
+    quoted = urllib.parse.quote(REDDIT_JSON_URL, safe="")
+    for name, template in REDDIT_PROXIES:
+        url = template.format(q=quoted, raw=REDDIT_JSON_URL)
         try:
-            return fetch_reddit_oauth(client_id, client_secret)
+            resp = requests.get(
+                url,
+                headers={"User-Agent": BROWSER_USER_AGENT, "Accept": "application/json"},
+                timeout=25,
+            )
+            if resp.status_code >= 400:
+                print(f"Proxy {name} -> HTTP {resp.status_code}")
+                continue
+            posts = parse_reddit_listing(extract_listing(resp.text))
+            if posts:
+                return posts
+            print(f"Proxy {name} returned no posts")
         except Exception as exc:
-            print(f"Reddit OAuth failed ({type(exc).__name__}); falling back to RSS")
-    else:
-        print("REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET not set; using RSS fallback (no upvote counts)")
+            print(f"Proxy {name} failed: {type(exc).__name__}")
+    raise RuntimeError("all Reddit proxies failed")
+
+
+def fetch_reddit():
+    try:
+        return fetch_reddit_via_proxies()
+    except Exception as exc:
+        print(f"Reddit proxies failed ({type(exc).__name__}); trying direct RSS (no upvote counts)")
     last_exc = None
     for url in REDDIT_FEEDS:
         try:
@@ -262,7 +270,7 @@ def fetch_reddit():
         except Exception as exc:
             last_exc = exc
             print(f"Reddit endpoint failed ({type(exc).__name__}); trying next")
-    raise RuntimeError("all Reddit endpoints failed") from last_exc
+    raise RuntimeError("all Reddit sources failed") from last_exc
 
 
 # --------------------------------------------------------------------------- #
