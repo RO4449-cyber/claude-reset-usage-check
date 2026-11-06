@@ -1,0 +1,35 @@
+{
+  "min_upvotes": 5,
+  "high_confidence_phrases": [
+    "limits reset",
+    "limit reset",
+    "free reset",
+    "reset for everyone",
+    "limits increased",
+    "raised limits",
+    "bonus usage",
+    "free usage reset"
+  ],
+  "medium_keywords_group1": ["reset", "free", "bonus", "extra", "increased"],
+  "medium_keywords_group2": ["rate limit", "usage limit", "message limit", "quota", "messages"],
+  "negative_phrases": [
+    "how to reset",
+    "should i reset",
+    "does it reset",
+    "when does",
+    "help with limit",
+    "why did my"
+  ],
+  "score_threshold": 10,
+  "heartbeat_day_of_week": 6,
+  "heartbeat_hour_utc": 10,
+  "status_keywords": [
+    "rate limit",
+    "rate-limit",
+    "free tier",
+    "reset",
+    "compensat",
+    "restoration",
+    "restored"
+  ]
+}

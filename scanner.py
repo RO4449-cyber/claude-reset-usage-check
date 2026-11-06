@@ -1,127 +1,341 @@
 #!/usr/bin/env python3
-"""Scan Reddit r/ClaudeAI and Anthropic status RSS feeds for free usage/reset announcements."""
+"""Privacy-first scanner for Claude usage-limit reset announcements.
+
+Sources: Reddit r/ClaudeAI (JSON API) and the Anthropic status RSS feed.
+Alerts go to ntfy. The topic and optional token come from the environment
+(GitHub Secrets) and are never hardcoded or printed. Tunables live in config.json.
+"""
+import html
+import json
 import os
+import re
+import sys
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 
 import requests
 
-FEEDS = [
-    "https://www.reddit.com/r/ClaudeAI/new/.rss",
-    "https://status.anthropic.com/history.rss",
-]
-USER_AGENT = "claude-usage-reset-scanner/1.0 (github.com/RO4449-cyber/claude-reset-usage-check)"
-NTFY_TOPIC = "claude_reset_usage_V2"
-NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 SEEN_FILE = "seen_posts.txt"
-MAX_ENTRIES = 10
+STATE_FILE = "state.json"
+HEARTBEAT_FILE = "last_heartbeat.txt"
 
-# Title must contain one of these exact phrases (case-insensitive).
-EXACT_PHRASES = [
-    "limit reset",
-    "limits reset",
-    "reset limits",
-    "reset my limit",
-    "quota reset",
-    "usage reset",
-    "free reset",
-    "reset for everyone",
-    "extra messages",
-    "raised limits",
-    "limits increased",
+REDDIT_URL = "https://www.reddit.com/r/ClaudeAI/new.json?limit=15"
+STATUS_URL = "https://status.anthropic.com/history.rss"
+USER_AGENT = "claude-usage-reset-scanner/2.0"
+
+MAX_SEEN = 200
+STATUS_ENTRIES = 5
+FAILURE_LIMIT = 3
+SNIPPET_MAX = 220
+SNIPPET_LINES = 3
+MAX_ACTIVE_INCIDENTS = 20
+HIGH_WEIGHT = 10
+MEDIUM_WEIGHT = 5
+
+DEFAULT_STATUS_KEYWORDS = [
+    "rate limit", "rate-limit", "free tier", "reset", "compensat", "restoration", "restored",
 ]
-# ...or contain "reset" together with one of these.
-LIMIT_PHRASES = ["rate limit", "usage limit", "message limit"]
-# Titles containing any of these are user questions and are ignored.
-IGNORE_PHRASES = ["how to reset", "should i reset", "does it reset"]
+RESOLVED_STATES = {"resolved", "completed"}
+
+TAGS_REDDIT = "gift,rocket"
+TAGS_STATUS = "warning,loudspeaker"
+TAGS_RESOLVED = "white_check_mark,bell"
+
+
+# --------------------------------------------------------------------------- #
+# Config / state files
+# --------------------------------------------------------------------------- #
+def load_config():
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    cfg.setdefault("status_keywords", DEFAULT_STATUS_KEYWORDS)
+    return cfg
 
 
 def load_seen():
     if not os.path.exists(SEEN_FILE):
-        return set()
+        return []
+    out, dedup = [], set()
     with open(SEEN_FILE, "r", encoding="utf-8") as f:
-        return {line.strip() for line in f if line.strip()}
+        for line in f:
+            line = line.strip()
+            if line and line not in dedup:
+                dedup.add(line)
+                out.append(line)
+    return out
 
 
 def save_seen(seen):
+    """Keep only the latest MAX_SEEN ids so the file never grows indefinitely."""
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        for item in sorted(seen):
+        for item in seen[-MAX_SEEN:]:
             f.write(item + "\n")
 
 
-def local(tag):
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        failures = int(raw.get("consecutive_failures", 0))
+        active = raw.get("active_incidents", {})
+        if not isinstance(active, dict):
+            active = {}
+    except (OSError, ValueError, TypeError, AttributeError):
+        failures, active = 0, {}
+    return {"consecutive_failures": failures, "active_incidents": active}
+
+
+def save_state(state):
+    active = state["active_incidents"]
+    while len(active) > MAX_ACTIVE_INCIDENTS:
+        active.pop(next(iter(active)))
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# --------------------------------------------------------------------------- #
+# Text helpers
+# --------------------------------------------------------------------------- #
+def clean_text(raw):
+    """Strip HTML tags/entities, keeping line breaks."""
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</li>", "\n", raw or "")
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in text.splitlines()]
+    return "\n".join(ln for ln in lines if ln)
+
+
+def snippet(raw, max_chars=SNIPPET_MAX, max_lines=SNIPPET_LINES):
+    lines = clean_text(raw).splitlines()[:max_lines]
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[: max_chars - 1].rstrip() + "…"
+    return text
+
+
+# --------------------------------------------------------------------------- #
+# Reddit scoring
+# --------------------------------------------------------------------------- #
+def score_title(title, cfg):
+    """Return (relevance_score, high_confidence_match_count); score is None if blocked."""
+    t = title.lower()
+    if any(p.lower() in t for p in cfg["negative_phrases"]):
+        return None, 0
+    high = [p for p in cfg["high_confidence_phrases"] if p.lower() in t]
+    score = HIGH_WEIGHT if high else 0
+    if any(k.lower() in t for k in cfg["medium_keywords_group1"]):
+        score += MEDIUM_WEIGHT
+    if any(k.lower() in t for k in cfg["medium_keywords_group2"]):
+        score += MEDIUM_WEIGHT
+    return score, len(high)
+
+
+def reddit_should_alert(post, cfg):
+    score, high_count = score_title(post["title"], cfg)
+    if score is None or score < cfg["score_threshold"]:
+        return False
+    return post["score"] >= cfg["min_upvotes"] or high_count >= 2
+
+
+def fetch_reddit():
+    resp = requests.get(REDDIT_URL, headers={"User-Agent": USER_AGENT}, timeout=20)
+    resp.raise_for_status()
+    posts = []
+    for child in resp.json()["data"]["children"]:
+        d = child["data"]
+        permalink = d.get("permalink")
+        link = "https://www.reddit.com" + permalink if permalink else d.get("url", "")
+        posts.append({
+            "id": d["id"],
+            "title": d.get("title", ""),
+            "selftext": d.get("selftext", ""),
+            "url": link,
+            "score": int(d.get("score", 0)),
+            "flair": d.get("link_flair_text") or "",
+        })
+    return posts
+
+
+# --------------------------------------------------------------------------- #
+# Anthropic status RSS
+# --------------------------------------------------------------------------- #
+def _local(tag):
     return tag.rsplit("}", 1)[-1]
 
 
-def child_text(elem, name):
+def _child_text(elem, name):
     for c in elem:
-        if local(c.tag) == name:
+        if _local(c.tag) == name:
             return "".join(c.itertext()).strip()
     return ""
 
 
-def entry_link(elem):
+def _entry_link(elem):
     for c in elem:
-        if local(c.tag) == "link":
+        if _local(c.tag) == "link":
             return c.attrib.get("href") or (c.text or "").strip()
     return ""
 
 
-def parse_feed(xml_bytes):
+def parse_status(xml_bytes):
     root = ET.fromstring(xml_bytes)
-    entries = [e for e in root.iter() if local(e.tag) in ("entry", "item")]
-    results = []
-    for e in entries[:MAX_ENTRIES]:
-        title = child_text(e, "title")
-        link = entry_link(e)
-        eid = child_text(e, "id") or child_text(e, "guid") or link
-        results.append({"id": eid, "title": title, "link": link})
-    return results
+    items = [e for e in root.iter() if _local(e.tag) in ("item", "entry")][:STATUS_ENTRIES]
+    incidents = []
+    for e in items:
+        link = _entry_link(e)
+        raw_desc = _child_text(e, "description") or _child_text(e, "content") or _child_text(e, "summary")
+        state = _child_text(e, "status")
+        if not state:
+            # Statuspage feeds list updates newest-first as <strong>State</strong> - text.
+            m = re.search(r"<strong>\s*([A-Za-z ]+?)\s*</strong>", raw_desc)
+            state = m.group(1) if m else ""
+        incidents.append({
+            "id": _child_text(e, "guid") or _child_text(e, "id") or link,
+            "title": _child_text(e, "title"),
+            "link": link,
+            "description": raw_desc,
+            "status": state.strip(),
+        })
+    return incidents
 
 
-def matches(title):
-    t = title.lower()
-    if any(p in t for p in IGNORE_PHRASES):
-        return False
-    if any(p in t for p in EXACT_PHRASES):
-        return True
-    return "reset" in t and any(p in t for p in LIMIT_PHRASES)
-
-
-def send_alert(title, link):
-    resp = requests.post(
-        NTFY_URL,
-        data=f"{title}\n{link}".encode("utf-8"),
-        headers={
-            "Title": "Claude Free Reset Alert!",
-            "Priority": "high",
-            "Tags": "gift,robot",
-        },
-        timeout=15,
-    )
+def fetch_status():
+    resp = requests.get(STATUS_URL, headers={"User-Agent": USER_AGENT}, timeout=20)
     resp.raise_for_status()
+    return parse_status(resp.content)
 
 
+def status_relevant(incident, cfg):
+    text = (incident["title"] + " " + clean_text(incident["description"])).lower()
+    return any(k.lower() in text for k in cfg["status_keywords"])
+
+
+# --------------------------------------------------------------------------- #
+# ntfy
+# --------------------------------------------------------------------------- #
+def send_ntfy(topic, token, body, title, tags, priority="high", link=None, sound=True):
+    """POST to ntfy. Returns True on success. Never logs the URL (it contains the topic)."""
+    headers = {"Title": title, "Priority": priority, "Tags": tags}
+    if sound:
+        headers["X-Sound"] = "alarm"
+    if link:
+        safe = link.replace(",", "%2C").replace(";", "%3B")
+        headers["Actions"] = f"view, Open Post, {safe}, clear=true"
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        resp = requests.post(
+            f"https://ntfy.sh/{topic}", data=body.encode("utf-8"), headers=headers, timeout=15
+        )
+        resp.raise_for_status()
+        return True
+    except Exception as exc:  # exception text can embed the URL/topic, so log only the type
+        print(f"ntfy send failed: {type(exc).__name__}")
+        return False
+
+
+def build_body(title, text, flair=""):
+    head = f"[{flair}] {title}" if flair else title
+    return f"{head}\n{text}" if text else head
+
+
+# --------------------------------------------------------------------------- #
+# Heartbeat
+# --------------------------------------------------------------------------- #
+def heartbeat_due(now, cfg):
+    if now.weekday() != cfg["heartbeat_day_of_week"] or now.hour != cfg["heartbeat_hour_utc"]:
+        return False
+    try:
+        with open(HEARTBEAT_FILE, "r", encoding="utf-8") as f:
+            last = f.read().strip()
+    except OSError:
+        last = ""
+    return last != now.date().isoformat()
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
 def main():
+    topic = os.environ["NTFY_TOPIC"].strip()  # required; stored in GitHub Secrets
+    if not topic:
+        sys.exit("NTFY_TOPIC is empty - add it as a repository secret.")
+    token = os.environ.get("NTFY_TOKEN") or None
+
+    cfg = load_config()
     seen = load_seen()
-    for url in FEEDS:
-        try:
-            resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=20)
-            resp.raise_for_status()
-            entries = parse_feed(resp.content)
-        except Exception as exc:
-            print(f"Failed to fetch {url}: {exc}")
-            continue
-        for entry in entries:
-            if entry["id"] in seen or not matches(entry["title"]):
+    seen_set = set(seen)
+    state = load_state()
+    now = datetime.now(timezone.utc)
+    failed = False
+
+    def mark(key):
+        if key not in seen_set:
+            seen_set.add(key)
+            seen.append(key)
+
+    # --- Reddit ---
+    try:
+        for post in fetch_reddit():
+            key = "reddit:" + post["id"]
+            if key in seen_set or not reddit_should_alert(post, cfg):
                 continue
-            try:
-                send_alert(entry["title"], entry["link"])
-            except Exception as exc:
-                print(f"Failed to send alert for {entry['id']}: {exc}")
+            body = build_body(post["title"], snippet(post["selftext"]), post["flair"])
+            if send_ntfy(topic, token, body, "Claude Free Reset Alert!", TAGS_REDDIT, link=post["url"]):
+                mark(key)
+                print("Alerted: reddit post")
+    except Exception as exc:
+        failed = True
+        print(f"Reddit fetch failed: {type(exc).__name__}")
+
+    # --- Anthropic status ---
+    try:
+        active = state["active_incidents"]
+        for inc in fetch_status():
+            key = "status:" + inc["id"]
+            resolved = inc["status"].lower() in RESOLVED_STATES
+            if resolved:
+                if inc["id"] in active:
+                    body = build_body(inc["title"], snippet(inc["description"]))
+                    if send_ntfy(topic, token, "Resolved / Event Ended\n" + body,
+                                 "Claude Status: Event Ended", TAGS_RESOLVED,
+                                 priority="default", link=inc["link"]):
+                        del active[inc["id"]]
+                        print("Alerted: incident resolved")
                 continue
-            seen.add(entry["id"])
-            print(f"Alerted: {entry['title']}")
+            if key in seen_set or not status_relevant(inc, cfg):
+                continue
+            body = build_body(inc["title"], snippet(inc["description"]))
+            if send_ntfy(topic, token, body, "Claude Status Incident", TAGS_STATUS, link=inc["link"]):
+                mark(key)
+                active[inc["id"]] = inc["title"]
+                print("Alerted: status incident")
+    except Exception as exc:
+        failed = True
+        print(f"Status fetch failed: {type(exc).__name__}")
+
+    # --- Consecutive failure tracking ---
+    if failed:
+        state["consecutive_failures"] += 1
+        if state["consecutive_failures"] >= FAILURE_LIMIT:
+            if send_ntfy(topic, token, "⚠️ הסקריפט נתקל ב-3 שגיאות רצופות ודורש בדיקה",
+                         "Claude Scanner Error", TAGS_STATUS):
+                state["consecutive_failures"] = 0
+    else:
+        state["consecutive_failures"] = 0
+
+    # --- Weekly heartbeat ---
+    if heartbeat_due(now, cfg):
+        if send_ntfy(topic, token, "Claude Scanner Heartbeat: המערכת פעילה וסורקת תקין ✅",
+                     "Claude Scanner Heartbeat", TAGS_RESOLVED, priority="low", sound=False):
+            with open(HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+                f.write(now.date().isoformat())
+
     save_seen(seen)
+    save_state(state)
+    # Always exit 0 on fetch problems: actions/cache only saves state after a successful job.
 
 
 if __name__ == "__main__":
