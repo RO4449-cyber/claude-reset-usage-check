@@ -10,7 +10,8 @@ FEEDS = [
     "https://status.anthropic.com/history.rss",
 ]
 USER_AGENT = "claude-usage-reset-scanner/1.0 (github.com/RO4449-cyber/claude-reset-usage-check)"
-NTFY_URL = "https://ntfy.sh/claude_usage_reset_check"
+NTFY_TOPIC = "claude_reset_usage_V2"
+NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}"
 SEEN_FILE = "seen_posts.txt"
 MAX_ENTRIES = 10
 
