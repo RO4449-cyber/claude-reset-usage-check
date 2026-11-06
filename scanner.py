@@ -230,6 +230,18 @@ def main():
     now = datetime.now(timezone.utc)
     failed = False
 
+    # --- Optional manual test notification (workflow_dispatch input send_test) ---
+    if os.environ.get("SEND_TEST", "").lower() == "true":
+        repo_url = "{}/{}".format(os.environ.get("GITHUB_SERVER_URL", "https://github.com"),
+                                  os.environ.get("GITHUB_REPOSITORY", ""))
+        body = ("TEST: Claude Scanner is working ✅\n"
+                "If you see this on your phone, alerts reach you.\n"
+                "Priority high + alarm sound + tap the button to open the run page.")
+        if send_ntfy(topic, token, body, "Claude Scanner TEST", TAGS_STATUS, link=repo_url + "/actions"):
+            print("Test notification sent")
+        else:
+            sys.exit("Test notification FAILED")
+
     # --- Anthropic status ---
     try:
         active = state["active_incidents"]

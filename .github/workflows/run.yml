@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
+    inputs:
+      send_test:
+        description: "Send a test notification to ntfy"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -42,4 +47,5 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          SEND_TEST: ${{ inputs.send_test }}
         run: python scanner.py
