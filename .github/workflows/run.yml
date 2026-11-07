@@ -9,6 +9,10 @@ on:
         description: "Send a test notification to ntfy"
         type: boolean
         default: false
+      send_monthly_report:
+        description: "Send the monthly stats report now"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -48,4 +52,5 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           SEND_TEST: ${{ inputs.send_test }}
+          SEND_MONTHLY: ${{ inputs.send_monthly_report }}
         run: python scanner.py

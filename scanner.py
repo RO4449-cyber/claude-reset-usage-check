@@ -5,13 +5,14 @@ Source: the Anthropic status RSS feed. Alerts go to ntfy. The topic and optional
 from the environment (GitHub Secrets) and are never hardcoded or printed. Tunables live in
 config.json.
 """
+import calendar
 import html
 import json
 import os
 import re
 import sys
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -30,6 +31,9 @@ FAILURE_LIMIT = 3
 SNIPPET_MAX = 220
 SNIPPET_LINES = 3
 MAX_ACTIVE_INCIDENTS = 20
+MAX_STAT_MONTHS = 3
+MAX_REPORT_MARKERS = 8
+RUNS_PER_DAY = 144  # cron */10
 
 DEFAULT_STATUS_KEYWORDS = [
     "rate limit", "rate-limit", "free tier", "reset", "compensat", "restoration", "restored",
@@ -38,6 +42,7 @@ RESOLVED_STATES = {"resolved", "completed"}
 
 TAGS_STATUS = "warning,loudspeaker"
 TAGS_RESOLVED = "white_check_mark,bell"
+TAGS_REPORT = "bar_chart,calendar"
 
 
 # --------------------------------------------------------------------------- #
@@ -71,22 +76,28 @@ def save_seen(seen):
 
 
 def load_state():
+    state = {"consecutive_failures": 0, "active_incidents": {}, "stats": {}, "reports_sent": []}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        failures = int(raw.get("consecutive_failures", 0))
-        active = raw.get("active_incidents", {})
-        if not isinstance(active, dict):
-            active = {}
+        state["consecutive_failures"] = int(raw.get("consecutive_failures", 0))
+        for key in ("active_incidents", "stats"):
+            if isinstance(raw.get(key), dict):
+                state[key] = raw[key]
+        if isinstance(raw.get("reports_sent"), list):
+            state["reports_sent"] = [str(x) for x in raw["reports_sent"]]
     except (OSError, ValueError, TypeError, AttributeError):
-        failures, active = 0, {}
-    return {"consecutive_failures": failures, "active_incidents": active}
+        pass
+    return state
 
 
 def save_state(state):
     active = state["active_incidents"]
     while len(active) > MAX_ACTIVE_INCIDENTS:
         active.pop(next(iter(active)))
+    for old in sorted(state["stats"])[:-MAX_STAT_MONTHS]:
+        del state["stats"][old]
+    state["reports_sent"] = state["reports_sent"][-MAX_REPORT_MARKERS:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
@@ -215,6 +226,61 @@ def heartbeat_due(now, cfg):
 
 
 # --------------------------------------------------------------------------- #
+# Monthly report
+# --------------------------------------------------------------------------- #
+def month_key(dt):
+    return dt.strftime("%Y-%m")
+
+
+def monthly_report_due(now, cfg, state):
+    """Return (kind, marker) on the 1st ("start") or last day ("end") of the month, once."""
+    if now.hour != cfg.get("monthly_report_hour_utc", cfg["heartbeat_hour_utc"]):
+        return None
+    if now.day == 1:
+        kind = "start"
+    elif (now + timedelta(days=1)).month != now.month:
+        kind = "end"
+    else:
+        return None
+    marker = f"{now.date().isoformat()}:{kind}"
+    return None if marker in state["reports_sent"] else (kind, marker)
+
+
+def build_monthly_report(kind, now, state):
+    """Plain-text summary of the scanner's own activity."""
+    if kind == "start":  # report on the month that just ended
+        period_dt = now.replace(day=1) - timedelta(days=1)
+        scope = "full month"
+    else:
+        period_dt = now
+        scope = "month so far" if kind == "now" else "month end"
+    key = month_key(period_dt)
+    st = state["stats"].get(key, {})
+    runs, fails = int(st.get("runs", 0)), int(st.get("fetch_failures", 0))
+    expected = calendar.monthrange(period_dt.year, period_dt.month)[1] * RUNS_PER_DAY
+    fail_pct = (100.0 * fails / runs) if runs else 0.0
+    last_ok = st.get("last_success", "never")
+    healthy = runs > 0 and fail_pct < 5 and state["consecutive_failures"] == 0
+    verdict = "✅ OK - everything looks healthy" if healthy else "⚠️ CHECK - open the Actions tab and look at the latest runs"
+    return (
+        f"Claude Scanner monthly report - {key} ({scope})\n"
+        f"Status: {verdict}\n\n"
+        "What it does: every ~10 minutes it checks status.anthropic.com for incidents about "
+        "rate limits, resets, compensation or restoration and alerts you here. It sends an "
+        "'Event Ended' message when such an incident resolves, a heartbeat every Sunday, and an "
+        "error alert after 3 failed scans in a row. Reddit is not tracked.\n\n"
+        "Stats:\n"
+        f"- Scans run: {runs} (about {expected} expected for a full month)\n"
+        f"- Failed fetches: {fails} ({fail_pct:.1f}%)\n"
+        f"- Incident alerts sent: {int(st.get('alerts', 0))}\n"
+        f"- 'Event Ended' alerts sent: {int(st.get('resolved', 0))}\n"
+        f"- Last successful scan: {last_ok}\n\n"
+        "Reminder: GitHub pauses scheduled runs in a public repo after 60 days with no repo "
+        "activity. If these reports stop, open Actions > Claude Usage Reset Scanner > Enable workflow."
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main():
@@ -229,6 +295,8 @@ def main():
     state = load_state()
     now = datetime.now(timezone.utc)
     failed = False
+    stats = state["stats"].setdefault(month_key(now), {})
+    stats["runs"] = int(stats.get("runs", 0)) + 1
 
     # --- Optional manual test notification (workflow_dispatch input send_test) ---
     if os.environ.get("SEND_TEST", "").lower() == "true":
@@ -254,6 +322,7 @@ def main():
                                  "Claude Status: Event Ended", TAGS_RESOLVED,
                                  priority="default", link=inc["link"]):
                         del active[inc["id"]]
+                        stats["resolved"] = int(stats.get("resolved", 0)) + 1
                         print("Alerted: incident resolved")
                 continue
             if key in seen_set or not status_relevant(inc, cfg):
@@ -263,6 +332,7 @@ def main():
                 seen_set.add(key)
                 seen.append(key)
                 active[inc["id"]] = inc["title"]
+                stats["alerts"] = int(stats.get("alerts", 0)) + 1
                 print("Alerted: status incident")
     except Exception as exc:
         failed = True
@@ -270,6 +340,7 @@ def main():
 
     # --- Consecutive failure tracking ---
     if failed:
+        stats["fetch_failures"] = int(stats.get("fetch_failures", 0)) + 1
         state["consecutive_failures"] += 1
         if state["consecutive_failures"] >= FAILURE_LIMIT:
             if send_ntfy(topic, token, "⚠️ הסקריפט נתקל ב-3 שגיאות רצופות ודורש בדיקה",
@@ -277,6 +348,7 @@ def main():
                 state["consecutive_failures"] = 0
     else:
         state["consecutive_failures"] = 0
+        stats["last_success"] = now.strftime("%Y-%m-%d %H:%M UTC")
 
     # --- Weekly heartbeat ---
     if heartbeat_due(now, cfg):
@@ -284,6 +356,23 @@ def main():
                      "Claude Scanner Heartbeat", TAGS_RESOLVED, priority="low", sound=False):
             with open(HEARTBEAT_FILE, "w", encoding="utf-8") as f:
                 f.write(now.date().isoformat())
+
+    # --- Monthly report (1st and last day of the month; SEND_MONTHLY=true forces one now) ---
+    repo_url = "{}/{}".format(os.environ.get("GITHUB_SERVER_URL", "https://github.com"),
+                              os.environ.get("GITHUB_REPOSITORY", ""))
+    due = monthly_report_due(now, cfg, state)
+    if os.environ.get("SEND_MONTHLY", "").lower() == "true":
+        if send_ntfy(topic, token, build_monthly_report("now", now, state),
+                     "Claude Scanner Monthly Report", TAGS_REPORT, priority="default",
+                     link=repo_url + "/actions", sound=False):
+            print("Monthly report sent (manual)")
+    elif due:
+        kind, marker = due
+        if send_ntfy(topic, token, build_monthly_report(kind, now, state),
+                     "Claude Scanner Monthly Report", TAGS_REPORT, priority="default",
+                     link=repo_url + "/actions", sound=False):
+            state["reports_sent"].append(marker)
+            print("Monthly report sent")
 
     save_seen(seen)
     save_state(state)

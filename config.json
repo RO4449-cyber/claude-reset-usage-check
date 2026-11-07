@@ -1,6 +1,7 @@
 {
   "heartbeat_day_of_week": 6,
   "heartbeat_hour_utc": 10,
+  "monthly_report_hour_utc": 10,
   "status_keywords": [
     "rate limit",
     "rate-limit",
