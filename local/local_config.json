@@ -1,0 +1,31 @@
+{
+  "subreddits": ["ClaudeAI", "Anthropic"],
+  "interval_seconds": 600,
+  "min_upvotes": 5,
+  "score_threshold": 10,
+  "high_confidence_phrases": [
+    "limits reset",
+    "limit reset",
+    "usage reset",
+    "free reset",
+    "full reset",
+    "reset for free",
+    "reset for everyone",
+    "limits increased",
+    "raised limits",
+    "bonus usage",
+    "free usage"
+  ],
+  "medium_keywords_group1": ["reset", "free", "bonus", "extra", "increased"],
+  "medium_keywords_group2": ["rate limit", "usage limit", "message limit", "limits", "quota", "messages"],
+  "negative_phrases": [
+    "how to reset",
+    "should i reset",
+    "does it reset",
+    "when does",
+    "help with limit",
+    "why did my"
+  ],
+  "heartbeat_day_of_week": 6,
+  "heartbeat_hour_local": 10
+}

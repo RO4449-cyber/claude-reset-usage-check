@@ -1,0 +1,5 @@
+local/.env
+local/seen_local.txt
+local/state_local.json
+local/*.log
+__pycache__/
